@@ -1,0 +1,23 @@
+# rclust configuration. Copy to ~/.config/rclust/config.yaml (or run `rclust config`)
+# and replace the placeholders.
+
+# history (default), earliest or balanced; see the README
+default_policy: history
+
+clusters:
+  cluster-a:                    # the name used in rclust commands
+    host: hpc1.example.edu      # login host, or an alias from ~/.ssh/config (default: the name)
+    user: your-username         # optional; default comes from your SSH config
+    account: my-project         # optional; adds --account=my-project
+    tags: [gpu]                 # optional; select with --tags
+    gpu_types:                  # optional; GPU names and how to request them in Slurm
+      - type: h100
+        slurm_spec: nvidia_h100_80gb_hbm3
+    # ssh_key: ~/.ssh/id_ed25519
+
+  cluster-b:
+    host: hpc2.example.edu
+    account: my-project
+    cpu_account: my-project-cpu # optional; account for CPU-only jobs, if your site splits them
+    remote_dir: ~/jobs          # where job scripts are copied (default ~/cluster_scheduler_jobs)
+    tags: [cpu]
