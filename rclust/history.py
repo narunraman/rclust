@@ -219,6 +219,12 @@ class History:
         sql = f"SELECT wait_s, started FROM jobs WHERE {' AND '.join(where)}"
         return list(self.db.execute(sql, args))
 
+    def first_eligible(self, cluster: str, since: int) -> Optional[int]:
+        """When the oldest job on record for `cluster` after `since` became eligible."""
+        row = self.db.execute("SELECT MIN(eligible) FROM jobs WHERE cluster = ? AND eligible >= ?",
+                              (cluster, since)).fetchone()
+        return row[0] if row else None
+
 
 # --- fetching ------------------------------------------------------------------------------------
 
@@ -306,19 +312,38 @@ class Summary:
     p80: Optional[int]
     loose: bool               # matched on GPUs only, because too few jobs matched the full shape
     mean24: Optional[float] = None   # average wait, each capped at 24h (restricted_mean)
+    span_s: Optional[int] = None     # how far back this cluster's history reaches (at most `days`)
 
 
 def summarize(history: History, clusters: Sequence[str], spec: JobSpec, days: float = 7,
               min_jobs: int = 20) -> List[Summary]:
-    since = int((datetime.now() - timedelta(days=days)).timestamp())
+    now = datetime.now()
+    since = int((now - timedelta(days=days)).timestamp())
     out = []
     for name in clusters:
         obs, loose = history.waits(name, spec, since), False
         if len(obs) < min_jobs:
             obs, loose = history.waits(name, spec, since, loose=True), True
         median, p80 = km_quantiles(obs, [0.5, 0.8]) if obs else (None, None)
-        out.append(Summary(name, len(obs), sum(1 - s for _, s in obs), median, p80, loose, restricted_mean(obs)))
+        first = history.first_eligible(name, since)
+        span = max(0, int(now.timestamp()) - first) if first is not None else None
+        out.append(Summary(name, len(obs), sum(1 - s for _, s in obs), median, p80, loose,
+                           restricted_mean(obs), span))
     return out
+
+
+def fmt_span(seconds: Optional[float], days: float = 7) -> str:
+    """How much history a summary covers: '7 days', '3.5 days', '19 hours'. The window asked for
+    (`days`) is shown as is when the history reaches back that far (or is unknown)."""
+    if seconds is None or seconds >= days * 86400 - 3600:
+        return f"{days:g} day{'s' if days != 1 else ''}"
+    if seconds >= 1.95 * 86400:
+        return f"{round(seconds / 86400, 1):g} days"
+    if seconds >= 3600:
+        hours = round(seconds / 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
 def fmt_wait(seconds: Optional[int]) -> str:

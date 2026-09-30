@@ -93,9 +93,19 @@ def _connect_all(clusters, persist=None):
     return failed
 
 
+def _one_line(text):
+    return " ".join(str(text).split())
+
+
+def _report_skipped(scheduler):
+    """Say which clusters could not be probed, and why, in one line each."""
+    for name, error in sorted(scheduler.dispatcher.last_errors.items()):
+        console().print(f"[yellow]skipped {_esc(name)}:[/yellow] {_esc(_one_line(error))}")
+
+
 def _report_no_cluster(scheduler):
     dispatcher = scheduler.dispatcher
-    lines = [f"  {name}: {error}" for name, error in sorted(dispatcher.last_errors.items())]
+    lines = [f"  {name}: {_one_line(error)}" for name, error in sorted(dispatcher.last_errors.items())]
     message = "no suitable cluster found"
     if dispatcher.last_problem:
         message += f": {dispatcher.last_problem}"
@@ -119,8 +129,9 @@ def _format_wait(estimated_start):
 @main.command()
 @click.argument("cluster_name", required=False)
 @click.option("--add", is_flag=True, help="Add a new cluster.")
+@click.option("--example", is_flag=True, help="Print an annotated example config and exit.")
 @click.pass_context
-def config(ctx, cluster_name, add):
+def config(ctx, cluster_name, add, example):
     """
     Create or edit the config file interactively.
 
@@ -132,7 +143,15 @@ def config(ctx, cluster_name, add):
       rclust config              # list clusters; add or edit one
       rclust config cluster-a    # edit cluster-a
       rclust config --add        # add a cluster
+      rclust config --example > ~/.config/rclust/config.yaml
     """
+    if example:
+        if cluster_name or add:
+            raise click.UsageError("--example takes no cluster name and no --add")
+        from importlib.resources import files
+
+        click.echo(files("rclust").joinpath("config.yaml.example").read_text(), nl=False)
+        return
     import yaml
     from rich.prompt import Confirm, Prompt
     from .config import find_config, user_config_path
@@ -223,7 +242,9 @@ def _save_config(path, data):
 @main.command()
 @click.argument("clusters", nargs=-1)
 @click.option("--persist", "-p", default=None, metavar="DURATION",
-              help="How long an idle connection stays open (ssh ControlPersist, e.g. 30m, 4h). Default: 1h.")
+              help="How long an idle connection stays open (ssh ControlPersist, e.g. 30m, 4h). "
+                   "Default: ControlPersist from your ~/.ssh/config; if it sets none, the "
+                   "connection stays open until closed (ssh -O exit) or the network drops.")
 @click.pass_context
 def connect(ctx, clusters, persist):
     """
@@ -256,12 +277,18 @@ def connect(ctx, clusters, persist):
 
 def _select(scheduler, names):
     """Configured clusters with these names (all if none given); unknown names are an error."""
+    _check_names(scheduler, names)
+    return [c for c in scheduler.dispatcher.clusters if not names or c.name in names]
+
+
+def _check_names(scheduler, names, option=None):
+    """Fail if any of `names` is not a configured cluster."""
     clusters = scheduler.dispatcher.clusters
     unknown = sorted(set(names) - {c.name for c in clusters})
     if unknown:
-        fail(f"unknown cluster(s): {', '.join(unknown)}",
+        where = f" in {option}" if option else ""
+        fail(f"unknown cluster(s){where}: {', '.join(unknown)}",
              f"Configured: {', '.join(c.name for c in clusters)}")
-    return [c for c in clusters if not names or c.name in names]
 
 
 @main.command()
@@ -271,24 +298,28 @@ def discover(ctx, clusters):
     """
     List the GPU types on each cluster.
 
-    Prints a `resources` block per cluster to paste into its entry in the
-    config, so jobs that need GPUs skip clusters without them.
+    Prints a `resources` block per cluster, as plain YAML on stdout, to paste
+    into its entry in the config, so jobs that need GPUs skip clusters
+    without them. Types come from sinfo's GRES column, including partitions
+    hidden from a plain `sinfo`.
     """
     import re
+
+    from rich.console import Console
 
     scheduler = get_scheduler(ctx)
     targets = _select(scheduler, clusters)
     failed = _connect_all(targets)
-    out = console()
+    err = Console(stderr=True)  # progress and notes on stderr; the YAML alone on stdout
     lines = []
     for cluster in targets:
         if cluster.name in failed:
             continue
         try:
-            with out.status(f"Probing {cluster.name}..."):
+            with err.status(f"Probing {cluster.name}..."):
                 gpus = cluster.discover_resources().get("gpus", [])
         except Exception as e:
-            out.print(f"[red]✗ {cluster.name}:[/red] {_esc(e)}")
+            err.print(f"[red]✗ {cluster.name}:[/red] {_esc(e)}")
             failed.add(cluster.name)
             continue
         lines.append(f"  {cluster.name}:")
@@ -299,10 +330,8 @@ def discover(ctx, clusters):
         else:
             lines.append("    # no GPUs found")
     if lines:
-        from rich.panel import Panel
-
-        out.print(Panel("clusters:\n" + "\n".join(lines), title="Add to each cluster in your config",
-                        border_style="green"))
+        err.print("[dim]# Add to each cluster in your config:[/dim]")
+        click.echo("clusters:\n" + "\n".join(lines))
     if failed:
         fail(f"could not probe {', '.join(sorted(failed))}")
 
@@ -318,10 +347,30 @@ def _policy_callback(ctx, param, value):
     return value
 
 
+def _gpus_callback(ctx, param, value):
+    """--gpus N or --gpus TYPE:N -> (type or None, N)."""
+    if value is None:
+        return None
+    gpu_type, _, count = value.strip().rpartition(":")
+    if not count.isdigit() or (gpu_type == "" and ":" in value) or any(c.isspace() or c in ":," for c in gpu_type):
+        raise click.BadParameter(f"expected a number of GPUs or TYPE:NUMBER (e.g. 2 or h100:2), not {value!r}")
+    return (gpu_type or None, int(count))
+
+
+def _gpu_type_callback(ctx, param, value):
+    if value is not None and (not value.strip() or any(c.isspace() or c in ":," for c in value)):
+        raise click.BadParameter(f"expected a GPU type such as h100, not {value!r}")
+    return value
+
+
 def resource_options(f):
     for option in reversed([
         click.option("--cpus", type=click.IntRange(min=1), help="CPUs per task."),
-        click.option("--gpus", type=click.IntRange(min=0), help="GPUs."),
+        click.option("--gpus", metavar="[TYPE:]N", callback=_gpus_callback,
+                     help="GPUs, optionally of a type: 2 or h100:2."),
+        click.option("--gpu-type", metavar="TYPE", callback=_gpu_type_callback,
+                     help="GPU type, e.g. h100 (mapped through gpu_types in the config). "
+                          "Implies --gpus 1 if no count is given."),
         click.option("--mem", metavar="SIZE", help="Memory per node, e.g. 16G."),
         click.option("--time", metavar="TIME", help="Time limit, e.g. 2:00:00."),
         click.option("--policy", metavar="[history|earliest|balanced]", callback=_policy_callback,
@@ -336,23 +385,34 @@ def resource_options(f):
     return f
 
 
-def _job_spec(scheduler, script, cpus, gpus, mem, time):
-    """Requirements from the script's #SBATCH header (if any), overridden by command-line flags."""
+def _job_spec(scheduler, script, cpus, gpus, mem, time, gpu_type=None):
+    """Requirements from the script's #SBATCH header (if any), overridden by command-line flags.
+    `gpus` is (type or None, count) from --gpus; `gpu_type` is --gpu-type."""
     from .cluster import JobSpec
 
+    type_from_count, count = gpus if gpus is not None else (None, None)
+    if gpu_type and type_from_count and gpu_type != type_from_count:
+        raise click.UsageError(f"--gpus {type_from_count}:{count} and --gpu-type {gpu_type} disagree")
+    gpu_type = gpu_type or type_from_count
+    if gpu_type and count == 0:
+        raise click.UsageError("a GPU type needs at least 1 GPU")
     spec = JobSpec()
     if script:
         try:
             spec = scheduler.analyze(script)
         except (OSError, ValueError, UnicodeDecodeError) as e:
             fail(f"could not read {script}: {e}")
-    for field, value in (("cpus", cpus), ("gpus", gpus), ("memory", mem), ("time", time)):
+    for field, value in (("cpus", cpus), ("gpus", count), ("memory", mem), ("time", time)):
         if value is not None:
             setattr(spec, field, value)
     if mem is not None:
         spec.memory_per_cpu = None
-    if gpus == 0:
+    if count == 0:
         spec.gpu_type = None
+    if gpu_type:
+        spec.gpu_type = gpu_type
+        if not spec.gpus:
+            spec.gpus = 1
     return spec
 
 
@@ -375,7 +435,7 @@ def _with_probe_defaults(spec):
 @click.option("--days", type=click.FloatRange(min=0, min_open=True), default=7.0, show_default=True,
               help="With --explain: how many days of history to use.")
 @click.pass_context
-def suggest(ctx, script, cpus, gpus, mem, time, policy, tags, exclude, explain, days):
+def suggest(ctx, script, cpus, gpus, gpu_type, mem, time, policy, tags, exclude, explain, days):
     """
     Show which cluster a job would go to, without submitting it.
 
@@ -386,9 +446,11 @@ def suggest(ctx, script, cpus, gpus, mem, time, policy, tags, exclude, explain, 
     Examples:
       rclust suggest job.sh
       rclust suggest --gpus 1 --time 3:00:00 --explain
+      rclust suggest --gpus h100:2          # or: --gpus 2 --gpu-type h100
     """
     scheduler = get_scheduler(ctx)
-    spec = _job_spec(scheduler, script, cpus, gpus, mem, time)
+    _check_names(scheduler, exclude, "--exclude")
+    spec = _job_spec(scheduler, script, cpus, gpus, mem, time, gpu_type)
     if explain:
         _explain(scheduler, spec, days, exclude)
     spec = _with_probe_defaults(spec)
@@ -397,11 +459,14 @@ def suggest(ctx, script, cpus, gpus, mem, time, policy, tags, exclude, explain, 
                                                     exclude=list(exclude))
     if not cluster:
         _report_no_cluster(scheduler)
+    _report_skipped(scheduler)
     from rich.panel import Panel
 
     estimate = (f"Slurm's start estimate there: {_format_wait(metrics.estimated_start_time)} from now"
                 if metrics else "Slurm gave no start estimate")
-    console().print(Panel(f"[bold green]{cluster.name}[/bold green]\n[dim]{estimate}[/dim]",
+    reason = scheduler.dispatcher.last_reason
+    why = f"\n{_esc(reason)}" if reason else ""
+    console().print(Panel(f"[bold green]{cluster.name}[/bold green]{why}\n[dim]{estimate}[/dim]",
                           title="Suggested cluster", border_style="green", expand=False))
 
 
@@ -419,7 +484,7 @@ def suggest(ctx, script, cpus, gpus, mem, time, policy, tags, exclude, explain, 
 @click.option("--after-all", metavar="IDS",
               help="Start once these jobs (comma-separated IDs) have all completed successfully (afterok).")
 @click.pass_context
-def submit(ctx, target, remote_dir, cpus, gpus, mem, time, policy, tags, exclude, wait, on_running,
+def submit(ctx, target, remote_dir, cpus, gpus, gpu_type, mem, time, policy, tags, exclude, wait, on_running,
            after_any, after_all):
     """
     Submit a job script to the best cluster.
@@ -434,6 +499,7 @@ def submit(ctx, target, remote_dir, cpus, gpus, mem, time, policy, tags, exclude
     Examples:
       rclust submit job.sh
       rclust submit job.sh --gpus 2 --time 12:00:00
+      rclust submit job.sh --gpu-type h100
       rclust submit job.sh -x cluster-a --wait
       rclust submit job.sh --on-running "notify-send started"
       rclust submit job.sh --after-any 123,456
@@ -447,7 +513,8 @@ def submit(ctx, target, remote_dir, cpus, gpus, mem, time, policy, tags, exclude
         raise click.UsageError("--wait, --on-running, --after-* and --remote-dir need a job script, not a directory")
 
     scheduler = get_scheduler(ctx)
-    spec = _job_spec(scheduler, None if is_dir else target, cpus, gpus, mem, time)
+    _check_names(scheduler, exclude, "--exclude")
+    spec = _job_spec(scheduler, None if is_dir else target, cpus, gpus, mem, time, gpu_type)
     if after_any or after_all:
         ids = [i.strip() for i in (after_any or after_all).split(",")]
         if not all(i.isdigit() for i in ids):
@@ -466,8 +533,11 @@ def submit(ctx, target, remote_dir, cpus, gpus, mem, time, policy, tags, exclude
                                                     exclude=list(set(exclude) | failed))
     if not cluster:
         _report_no_cluster(scheduler)
+    _report_skipped(scheduler)
     estimate = f", estimated start in {_format_wait(metrics.estimated_start_time)}" if metrics else ""
     out.print(f"Selected [bold]{cluster.name}[/bold]{estimate}")
+    if scheduler.dispatcher.last_reason:
+        out.print(f"[dim]{_esc(scheduler.dispatcher.last_reason)}[/dim]")
 
     try:
         with out.status(f"Submitting to {cluster.name}..."):
@@ -582,10 +652,14 @@ def _explain(scheduler, spec, days, exclude=()):
     from rich.table import Table
 
     gpus = spec.gpus or 0
-    shape = f"{spec.cpus} CPUs" if not gpus and spec.cpus else f"{gpus} GPU{'s' if gpus != 1 else ''}"
+    gpu_name = f"{spec.gpu_type} GPU" if spec.gpu_type else "GPU"
+    shape = (f"{spec.cpus} CPUs" if not gpus and spec.cpus
+             else f"{gpus} {gpu_name}{'s' if gpus != 1 else ''}")
     if spec.time:
         shape += f", ~{spec.time}"
-    table = Table(title=f"Jobs like yours ({shape}), last {days:g} days", title_justify="left",
+    spans = [s.span_s for s in summaries if s.span_s is not None]
+    period = hist.fmt_span(max(spans) if spans else None, days)
+    table = Table(title=f"Jobs like yours ({shape}), last {period}", title_justify="left",
                   box=None, pad_edge=False, header_style="dim")
     for column, justify in (("cluster", "left"), ("jobs", "right"), ("median wait", "right"),
                             ("80% started within", "right"), ("avg wait (≤24h)", "right")):

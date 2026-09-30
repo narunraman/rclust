@@ -1,5 +1,6 @@
-# rclust configuration. Copy to ~/.config/rclust/config.yaml (or run `rclust config`)
-# and replace the placeholders.
+# rclust configuration. Save as ~/.config/rclust/config.yaml and replace the placeholders:
+#   mkdir -p ~/.config/rclust && rclust config --example > ~/.config/rclust/config.yaml
+# (or run `rclust config` to set it up interactively).
 
 # history (default), earliest or balanced; see the README
 default_policy: history

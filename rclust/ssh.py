@@ -15,12 +15,40 @@ logger = logging.getLogger(__name__)
 
 
 def quote_remote_path(path: str) -> str:
-    """Quote one remote shell path, allowing a leading ~/ to refer to remote home."""
+    """Quote one path for a remote *shell command* (ssh), allowing a leading ~/ to mean remote home."""
     if path == "~":
         return '"$HOME"'
     if path.startswith("~/"):
         return '"$HOME"/' + shlex.quote(path[2:])
     return shlex.quote(path)
+
+
+def rsync_remote_path(path: str) -> str:
+    """A remote path for an rsync destination, never relying on remote-shell expansion.
+
+    rsync >= 3.2.4 protects its arguments from the remote shell, so neither `~` nor `$HOME` is
+    expanded there. Both rsync and ssh resolve relative paths against the remote home directory,
+    so a leading `~/` is simply dropped ("~" alone becomes ".").
+    """
+    if path in ("~", "~/"):
+        return "."
+    if path.startswith("~/"):
+        path = path[2:].lstrip("/") or "."
+    if path.startswith("-"):
+        path = "./" + path  # never let a remote path look like an option
+    return path
+
+
+def _rsync_env() -> dict:
+    """Environment for rsync so one quoting rule works with every version.
+
+    With RSYNC_OLD_ARGS=1, rsync >= 3.2.4 hands the remote path to the remote shell as older
+    versions (and openrsync) always do, so a shell-quoted path means the same thing everywhere.
+    RSYNC_PROTECT_ARGS would switch older versions to the opposite rule, so it is dropped.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "RSYNC_PROTECT_ARGS"}
+    env["RSYNC_OLD_ARGS"] = "1"
+    return env
 
 
 class SSHClient:
@@ -36,6 +64,7 @@ class SSHClient:
         self.key_path = str(Path(key_path).expanduser()) if key_path else None
         self.name = name
         self._private_socket_dir = None
+        self.last_rsync_error: Optional[str] = None  # rsync's stderr (last lines) after a failed copy
         self.socket_path = Path(self._get_control_master_path())
 
     @property
@@ -88,7 +117,12 @@ class SSHClient:
             return False
 
     def connect(self, persist: Optional[str] = None):
-        """Authenticate interactively once; reuse the master for subsequent commands."""
+        """Authenticate interactively once; reuse the master for subsequent commands.
+
+        `persist` sets ControlPersist (how long an idle master stays open). Without it the user's
+        ssh config decides; if that sets nothing, the backgrounded master stays open until it is
+        closed (`ssh -O exit`), the machine sleeps or reboots, or the network drops.
+        """
         if self._is_connected():
             return
         if self._private_socket_dir:
@@ -99,8 +133,8 @@ class SSHClient:
         print(f"Connecting to {self.name or self.host} ({self.destination}); "
               "answer any password or two-factor prompts...")
         cmd = self._get_base_flags() + ["-M", "-S", str(self.socket_path)]
-        # Bound the background master when the user has not configured a duration.
-        cmd.extend(["-o", f"ControlPersist={persist if persist is not None else '1h'}"])
+        if persist is not None:  # otherwise defer to ControlPersist in the user's ssh config
+            cmd.extend(["-o", f"ControlPersist={persist}"])
         cmd.extend(["-f", "-N", self.destination])
         ret = subprocess.run(cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
         if ret.returncode != 0:
@@ -127,9 +161,12 @@ class SSHClient:
         return result.returncode, result.stdout.strip(), stderr
 
     def rsync(self, local_path: str, remote_path: str) -> bool:
-        # Quote the remote-shell path, including spaces and metacharacters; use an
-        # absolute local path so filenames beginning with '-' cannot become options.
-        target = f"{self.destination}:{quote_remote_path(remote_path)}"
+        """Copy to the cluster. On failure returns False and sets `last_rsync_error`."""
+        # The remote path is relative to the remote home (see rsync_remote_path) and shell-quoted
+        # for the remote side (see _rsync_env), so spaces and metacharacters stay one path. The
+        # local path is absolute so filenames beginning with '-' cannot become options.
+        self.last_rsync_error = None
+        target = f"{self.destination}:{shlex.quote(rsync_remote_path(remote_path))}"
         ssh_opt = shlex.join(self._get_base_flags() + ["-o", "BatchMode=yes", "-S", str(self.socket_path)])
         source = str(Path(local_path).absolute())
         if local_path.endswith(os.sep):
@@ -137,7 +174,16 @@ class SSHClient:
         rsync_cmd = ["rsync", "-az", "--exclude", ".git", "-e", ssh_opt,
                      source, target]
         try:
-            result = subprocess.run(rsync_cmd, capture_output=True, timeout=600)
-            return result.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
+            result = subprocess.run(rsync_cmd, capture_output=True, text=True, timeout=600,
+                                    env=_rsync_env())
+        except subprocess.TimeoutExpired:
+            self.last_rsync_error = "rsync timed out"
             return False
+        except OSError as e:
+            self.last_rsync_error = f"could not run rsync: {e}"
+            return False
+        if result.returncode != 0:
+            lines = [l for l in (result.stderr or "").strip().splitlines() if l.strip()]
+            self.last_rsync_error = "\n".join(lines[-3:]) or f"rsync exit code {result.returncode}"
+            return False
+        return True

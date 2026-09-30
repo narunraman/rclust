@@ -46,7 +46,8 @@ rclust submit job.sh          # send it there
 3. `./config.yaml` in the current directory
 4. `~/.config/rclust/config.yaml` (or `$XDG_CONFIG_HOME/rclust/config.yaml`)
 
-`rclust config` creates and edits it interactively; `config.yaml.example` is a starting point.
+`rclust config` creates and edits it interactively; `rclust config --example` prints an annotated
+example to start from (`rclust config --example > ~/.config/rclust/config.yaml`).
 
 ```yaml
 default_policy: history        # or earliest, balanced
@@ -70,6 +71,8 @@ clusters:
 ```
 
 Anything you can put in `~/.ssh/config` (ports, jump hosts, keys) works: give the alias as `host`.
+`remote_dir` (and `--remote-dir`) may start with `~/` or be relative; either way it is under your
+home directory on the cluster. Uploads work with any `rsync` version, including 3.2.4 and later.
 Clusters without `resources` or `gpu_types` are assumed to be able to run any job; with them, jobs
 that need GPUs skip clusters that have none (or not the requested type).
 
@@ -78,6 +81,7 @@ that need GPUs skip clusters that have none (or not the requested type).
 ```bash
 rclust submit job.sh                          # requirements from the script
 rclust submit job.sh --gpus 2 --time 12:00:00 # override them
+rclust submit job.sh --gpus h100:2            # a GPU type (or: --gpus 2 --gpu-type h100)
 rclust submit job.sh -x cluster-b --wait      # skip a cluster; wait until it's running
 rclust submit job.sh --on-running "notify-send started"   # run a local command once it starts
 rclust submit job.sh --after-any 123,456      # start after these jobs have ended (afterany)
@@ -85,6 +89,9 @@ rclust submit job.sh --remote-dir ~/experiments/run1
 rclust suggest --gpus 1 --time 3:00:00 --explain
 ```
 
+A GPU type given with `--gpu-type` or `--gpus TYPE:N` is looked up in the cluster's `gpu_types`
+(so `h100` can be requested as that site's `slurm_spec`), and clusters whose `resources` or
+`gpu_types` don't list it are skipped. `--gpu-type` alone means one GPU of that type.
 If the script sets neither CPUs nor GPUs, or no time limit, rclust asks for 1 CPU and 1 hour.
 Only the script is copied; code, data and environments must already be on each cluster it may go
 to. The job runs from your home directory on the cluster, as with a plain `sbatch`. Job IDs in
@@ -93,7 +100,10 @@ the job on that cluster. A directory containing a `submit.run` script (for examp
 farm) can also be submitted; it is copied to `~/farms/` and run.
 
 Only `connect` (and `submit` and `discover`, which connect first) may show login prompts; other
-commands fail fast if a cluster isn't connected, and say to run `rclust connect`. Expected failures (no config, no suitable cluster, a failed submission) print a
+commands fail fast if a cluster isn't connected, and say to run `rclust connect`. How long an idle
+connection stays open follows `ControlPersist` in your `~/.ssh/config`; if that sets nothing, it
+stays open until you close it (`ssh -O exit <host>`) or the network drops. `rclust connect -p 4h`
+sets it for that connection. Expected failures (no config, no suitable cluster, a failed submission) print a
 one-line error and exit with status 1; usage errors exit with 2.
 
 ### Scheduling policies
@@ -106,6 +116,10 @@ one-line error and exit with status 1; usage errors exit with 2.
   soonest. Near-ties (within 5 minutes) go to the cluster where your fairshare is higher.
 - **balanced**: favours clusters where your fairshare is high and you have few jobs running,
   skipping any with a wait over 24 hours.
+
+`suggest` and `submit` say which policy chose the cluster and why, e.g. `history: cluster-a can
+start it now` or `history: jobs like this waited least on cluster-b over the past week (median
+4m)`, and name any cluster they had to skip (`skipped cluster-c: sbatch: error: ...`).
 
 Old names still work: `learned` means `history`; `rush` and `queue-time` mean `earliest`.
 Start-time estimates are converted from each cluster's time zone before they are compared.

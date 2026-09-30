@@ -109,8 +109,8 @@ class GlobalConfig:
             looked = [str(config_path)] if path else [str(p) for p in config_search_paths()]
             raise ConfigError(
                 "no config file found (looked for " + ", ".join(looked) + "). "
-                "Create one with `rclust config`, or copy config.yaml.example to "
-                f"{user_config_path()}"
+                "Create one with `rclust config`, or save the annotated example from "
+                f"`rclust config --example` as {user_config_path()}"
             )
         try:
             data = yaml.safe_load(config_path.read_text()) or {}

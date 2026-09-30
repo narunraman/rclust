@@ -103,7 +103,8 @@ def test_submission_uses_same_gpu_mapping_as_probe_and_checks_copy(tmp_path):
     ssh.rsync.return_value = False
     with pytest.raises(RuntimeError, match="upload"):
         cluster.submit_job("job.sh", spec)
-    assert ssh.execute_command.call_count == 1  # Never submit after a failed upload.
+    # Never submit after a failed upload.
+    assert not any("sbatch" in call.args[0] for call in ssh.execute_command.call_args_list)
 
 
 def test_failed_probe_cannot_be_mistaken_for_start_now():

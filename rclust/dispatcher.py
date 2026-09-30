@@ -9,6 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 class Policy:
+    reason: Optional[str] = None  # after select(): why that cluster, in one line
+
     def select(self, candidates: Dict[Cluster, ClusterMetrics]) -> Optional[Cluster]:
         raise NotImplementedError
 
@@ -35,8 +37,10 @@ class FastestStartPolicy(Policy):
 
         if len(near_ties) > 1:
             near_ties.sort(key=lambda item: item[1].fairshare, reverse=True)
+            self.reason = "soonest estimated start (a near-tie, given to your higher fairshare)"
             return near_ties[0][0]
 
+        self.reason = "soonest estimated start"
         return best_cluster
 
 
@@ -79,6 +83,10 @@ class BalancedPolicy(Policy):
                 best_score = score
                 best_cluster = cluster
 
+        if best_cluster is not None:
+            m = candidates[best_cluster]
+            self.reason = (f"highest fairshare ({m.fairshare:.2f}) with few of your jobs running "
+                           f"({m.load})")
         return best_cluster
 
 
@@ -89,6 +97,7 @@ class QueueTimePolicy(Policy):
         if not candidates:
             return None
 
+        self.reason = "soonest estimated start"
         return min(candidates.items(), key=lambda item: item[1].estimated_start_time)[0]
 
 
@@ -109,6 +118,7 @@ class HistoryPolicy(Policy):
     def __init__(self, spec: JobSpec | dict[str, JobSpec], history=None):
         self.spec = spec
         self.history = history
+        self.summaries: Dict[str, object] = {}  # cluster name -> history.Summary, from scores()
 
     def scores(self, names: List[str]) -> Dict[str, float]:
         """Average recent wait (seconds, capped at 24 h) for jobs shaped like this, per cluster."""
@@ -124,6 +134,7 @@ class HistoryPolicy(Policy):
             for name in names:
                 spec = self.spec[name] if isinstance(self.spec, dict) else self.spec
                 summaries.extend(summarize(history, [name], spec, days=self.DAYS))
+            self.summaries = {s.cluster: s for s in summaries}
             return {s.cluster: s.mean24 for s in summaries if s.jobs and s.mean24 is not None}
         finally:
             if self.history is None:
@@ -140,9 +151,33 @@ class HistoryPolicy(Policy):
         scores = self.scores([c.name for c in pool])
         known = [c for c in pool if c.name in scores]
         if known:
-            return min(known, key=lambda c: scores[c.name])
+            best = min(known, key=lambda c: scores[c.name])
+            self.reason = self._explain(best, ready)
+            return best
         # no history for these clusters: fall back to Slurm's estimates
-        return FastestStartPolicy().select({c: candidates[c] for c in pool})
+        best = FastestStartPolicy().select({c: candidates[c] for c in pool})
+        if ready:
+            self.reason = f"{best.name} can start it now"
+        else:
+            self.reason = ("soonest estimated start (no queue history for these clusters yet; "
+                           "run `rclust learn`)")
+        return best
+
+    def _explain(self, best: Cluster, ready: List[Cluster]) -> str:
+        from .history import fmt_span, fmt_wait
+
+        if ready:
+            if len(ready) == 1:
+                return f"{best.name} can start it now"
+            return (f"{best.name} can start it now, and had the shortest recent waits "
+                    f"of the {len(ready)} that can")
+        summary = self.summaries.get(best.name)
+        span = getattr(summary, "span_s", None)
+        period = ("the past week" if span is None or span >= (self.DAYS - 0.5) * 86400
+                  else f"the past {fmt_span(span, self.DAYS)}")
+        like = "jobs with this many GPUs" if getattr(summary, "loose", False) else "jobs like this"
+        detail = f" (median {fmt_wait(summary.median)})" if summary is not None else ""
+        return f"{like} waited least on {best.name} over {period}{detail}"
 
 
 class Dispatcher:
@@ -175,6 +210,7 @@ class Dispatcher:
         self.last_metrics: Dict[Cluster, ClusterMetrics] = {}  # from the last propose_cluster
         self.last_errors: Dict[str, str] = {}   # cluster name -> why its probe failed
         self.last_problem: Optional[str] = None  # why the last propose_cluster found nothing
+        self.last_reason: Optional[str] = None   # why it chose what it chose: "policy: reason"
 
     def _fail(self, problem: str) -> None:
         self.last_problem = problem
@@ -232,6 +268,7 @@ class Dispatcher:
         self.last_metrics = {}
         self.last_errors = {}
         self.last_problem = None
+        self.last_reason = None
 
         def spec_for(cluster: Cluster) -> JobSpec:
             if per_cluster_specs:
@@ -293,6 +330,8 @@ class Dispatcher:
         selected = policy.select(cluster_metrics)
 
         if selected:
-            logger.info(f"Dispatcher selected: {selected.name}")
+            reason = getattr(policy, "reason", None)
+            self.last_reason = f"{name}: {reason}" if reason else name
+            logger.info(f"Dispatcher selected: {selected.name} ({self.last_reason})")
 
         return selected

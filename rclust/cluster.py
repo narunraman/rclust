@@ -12,6 +12,57 @@ from .ssh import SSHClient, quote_remote_path
 
 logger = logging.getLogger(__name__)
 
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_DECORATION = re.compile(r"^[\s\-=_*#~+|.:<>]*$")
+
+
+def error_lines(text: str) -> list:
+    """The meaningful lines of a remote error: ANSI colour codes stripped, blank and decorative
+    lines (rules of dashes, equals signs, stars...) and rclust's own markers dropped."""
+    lines = []
+    for line in _ANSI.sub("", text or "").replace("\r", "\n").splitlines():
+        line = " ".join(line.split())
+        if not line or _DECORATION.match(line) or line.startswith("RCLUST_"):
+            continue
+        if line not in lines:
+            lines.append(line)
+    return lines
+
+
+def summarize_error(text: str, limit: int = 2) -> str:
+    """One line saying why a remote command failed, preferring lines that mention an error."""
+    lines = error_lines(text)
+    errors = [l for l in lines if "error" in l.lower()]
+    # "Batch job submission failed: ..." is generic when a site prints its own explanation
+    specific = [l for l in errors if "batch job submission failed" not in l.lower()]
+    chosen = specific or errors or lines
+    return "; ".join(chosen[:limit])
+
+
+def parse_gres_gpu_types(gres: str) -> Set[str]:
+    """GPU types in one sinfo GRES string; "generic" for untyped GPUs.
+
+    Handles e.g. "gpu:a5000:4(S:0-1)", "gpu:nvidia_h100_80gb_hbm3:4",
+    "gpu:nvidia_h100_80gb_hbm3_1g.10gb:2(S:0),gpu:nvidia_h100_80gb_hbm3_3g.40gb:1(S:1)",
+    "gpu:4", "gpu:a100:no_consume:2", "gres/gpu:v100:2" and "(null)".
+    """
+    types = set()
+    # drop socket/index annotations such as "(S:0-1)" or "(IDX:0-3)"; they may contain commas
+    gres = re.sub(r"\([^)]*\)", "", gres or "")
+    for item in re.split(r"[,\s]+", gres):
+        parts = item.split(":")
+        if parts[0].rsplit("/", 1)[-1].lower() != "gpu" or len(parts) < 2:
+            continue
+        rest = [p for p in parts[1:] if p and p.lower() != "no_consume"]
+        if not rest:
+            continue
+        if len(rest) == 1:                  # gpu:COUNT (or a type without count)
+            types.add("generic" if rest[0].isdigit() else rest[0])
+        else:                               # gpu:TYPE:COUNT
+            if rest[0].lower() not in ("(null)", "null"):
+                types.add(rest[0])
+    return types
+
 
 @dataclass
 class JobSpec:
@@ -199,25 +250,18 @@ class SlurmCluster(Cluster):
         # several lines when you belong to several accounts: the best one
         return max(values) if values else 0.5
 
+    # --all: include partitions hidden from a plain `sinfo` (sbatch still accepts their GPUs);
+    # an explicit width, so a long GRES list is never cut short.
+    SINFO_GRES_CMD = "sinfo --all --noheader -o '%1000G'"
+
     def discover_resources(self) -> dict:
         """GPU types on the cluster, from sinfo's GRES column, as {"gpus": [...]} (for `resources`)."""
-        code, out, err = self.ssh.execute_command("sinfo -o '%N %P %G' --noheader")
+        code, out, err = self.ssh.execute_command(self.SINFO_GRES_CMD, use_login_shell=True)
         if code != 0:
-            raise RuntimeError(err or f"sinfo failed with exit code {code}")
+            raise RuntimeError(summarize_error(err) or f"sinfo failed with exit code {code}")
         gpus = set()
         for line in out.splitlines():
-            parts = line.split()
-            if len(parts) < 3 or "(null)" in parts[2]:
-                continue
-            for item in re.sub(r"\(.*?\)", "", parts[2]).split(","):  # drop "(S:0-3)" etc.
-                sub = item.split(":")
-                if sub[0] != "gpu" or len(sub) < 2:
-                    continue
-                if len(sub) == 2:            # gpu:COUNT
-                    if sub[1].isdigit():
-                        gpus.add("generic")
-                elif not sub[1].isdigit():   # gpu:TYPE:COUNT
-                    gpus.add(sub[1])
+            gpus.update(parse_gres_gpu_types(line))
         return {"gpus": sorted(gpus)} if gpus else {}
 
     def _get_load(self) -> Optional[int]:
@@ -247,7 +291,7 @@ class SlurmCluster(Cluster):
         # sbatch prints its estimate on stderr
         output = stdout + "\n" + stderr
         if code != 0 or "error" in output.lower():
-            detail = next((l.strip() for l in stderr.splitlines() if l.strip()), "") or f"exit code {code}"
+            detail = summarize_error(stderr) or summarize_error(stdout) or f"exit code {code}"
             self.last_error = detail
             logger.info(f"Probe failed on {self.name}: {detail}")
             return None
@@ -275,22 +319,43 @@ class SlurmCluster(Cluster):
 
         return None
 
+    def _make_remote_dir(self, path: str, what: str) -> bool:
+        """mkdir -p on the cluster. Returns True if the directory was created (did not exist)."""
+        quoted = quote_remote_path(path)
+        code, out, err = self.ssh.execute_command(
+            f"if [ -d {quoted} ]; then echo RCLUST_EXISTS; fi; mkdir -p -- {quoted}")
+        if code != 0:
+            raise RuntimeError(f"Could not create {what} {path} on {self.name}: {err or f'exit code {code}'}")
+        return "RCLUST_EXISTS" not in (out or "")
+
+    def _upload(self, local: str, remote: str, directory: str, created: bool, what: str) -> None:
+        """rsync, raising with rsync's own error; removes `directory` again if we created it."""
+        if self.ssh.rsync(local, remote):
+            return
+        detail = getattr(self.ssh, "last_rsync_error", None)
+        message = f"Could not upload {what} to {self.name}:{remote}"
+        if isinstance(detail, str) and detail:
+            message += "\n" + detail
+        if created:
+            # rmdir only removes it if it is still empty, so nothing else can be lost
+            code, _, _ = self.ssh.execute_command(f"rmdir -- {quote_remote_path(directory)}")
+            message += ("\n(removed the empty directory it had created)" if code == 0 else
+                        f"\n(could not remove {directory}, which it had created; it may not be empty)")
+        raise RuntimeError(message)
+
     def submit_job(
         self, script_path: str, job_spec: JobSpec, remote_dir: Optional[str] = None
     ) -> str:
         timestamp = uuid.uuid4().hex
-        base_dir = remote_dir or self.remote_dir
+        base_dir = (remote_dir or self.remote_dir).rstrip("/") or "/"
 
         script_name = Path(script_path).name
 
         remote_script_name = f"{timestamp}_{script_name}"
         remote_path = f"{base_dir}/{remote_script_name}"
 
-        code, _, err = self.ssh.execute_command(f"mkdir -p -- {quote_remote_path(base_dir)}")
-        if code != 0:
-            raise RuntimeError(f"Could not create remote directory: {err}")
-        if not self.ssh.rsync(script_path, remote_path):
-            raise RuntimeError(f"Could not upload job script to {self.name}")
+        created = self._make_remote_dir(base_dir, "remote directory")
+        self._upload(script_path, remote_path, base_dir, created, "job script")
 
         # submitted from the home directory, so that is the job's working directory
         cmd = f"sbatch {self._sbatch_args(job_spec)} -- {quote_remote_path(remote_path)}"
@@ -303,11 +368,8 @@ class SlurmCluster(Cluster):
         """Copy a directory to ~/farms/<name> and run its ./submit.run (e.g. a META-Farm farm)."""
         dirname = Path(farm_dir).name
         remote_path = f"~/farms/{dirname}"
-        code, _, err = self.ssh.execute_command(f"mkdir -p -- {quote_remote_path(remote_path)}")
-        if code != 0:
-            raise RuntimeError(f"Could not create farm directory: {err}")
-        if not self.ssh.rsync(str(Path(farm_dir)) + "/", remote_path + "/"):
-            raise RuntimeError(f"Failed to rsync farm directory to {self.name}")
+        created = self._make_remote_dir(remote_path, "farm directory")
+        self._upload(str(Path(farm_dir)) + "/", remote_path + "/", remote_path, created, "farm directory")
 
         cmd = f"cd -- {quote_remote_path(remote_path)} && ./submit.run"
         code, out, err = self.ssh.execute_command(cmd)
