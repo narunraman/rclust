@@ -189,3 +189,35 @@ scheduler.wait_until(job)                     # block until it is running
 `execute_command(cmd, timeout=..., use_login_shell=...)` method, for applications that manage their
 own connections. The package was called `scheduler` before 0.2; `import scheduler` still works but
 warns.
+
+## Testing against your own clusters
+
+`uv run pytest` is offline and fast: it never touches a real cluster, and the real-cluster tests
+in `tests/integration/` are skipped. To run them, name clusters from your own rclust config (found
+as rclust finds it: `--rclust-config PATH` for pytest in place of rclust's `--config`, then
+`$RCLUST_CONFIG`, `./config.yaml`, `~/.config/rclust/config.yaml`):
+
+```bash
+rclust connect                                                    # open the connections first
+RCLUST_TEST_CLUSTERS=all uv run pytest tests/integration -v       # every configured cluster
+RCLUST_TEST_CLUSTERS=cluster-a,cluster-b uv run pytest tests/integration -v
+```
+
+These are read-only: for each cluster they check that `sinfo`, `squeue -u $USER` and `sshare`
+work, that `rclust discover` parses its GPU types, that an hour of `sacct -a` history parses (into
+a temporary history database, not yours), and that `sbatch --test-only` gives a start estimate for
+1 CPU for 1 minute that lands on the right time once converted to your time zone (checked
+against the cluster's own clock), plus a `--gpu-type`/`--gpus TYPE:N` probe for a GPU type your
+config lists. The tests only reuse connections from `rclust connect` and never log in themselves
+(clusters may need two-factor login): a cluster without an open connection is skipped with
+"run `rclust connect <name>` first". An unknown name is an error that lists your clusters.
+
+To also check submission, add `RCLUST_TEST_SUBMIT=1`. This submits **one tiny real job** per
+selected cluster (1 CPU, 1 minute, 256M, `sleep 20; hostname`) through rclust's own submit path,
+into a new directory `~/rclust-it-<random>` on the cluster, waits up to 15 minutes for it to
+finish, checks that it COMPLETED, and removes the directory. It spends a little allocation; without
+the variable no job is ever submitted.
+
+```bash
+RCLUST_TEST_CLUSTERS=cluster-a RCLUST_TEST_SUBMIT=1 uv run pytest tests/integration -v
+```

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2
+
+- Placeholder cluster names in tests (`cluster-a`, `hpc1.example.edu`); no real site names.
+- Opt-in real-cluster tests in `tests/integration/`, run against the clusters in your own config:
+  `RCLUST_TEST_CLUSTERS=all uv run pytest tests/integration -v` for read-only checks (sinfo,
+  squeue, sshare, discover, sacct history, `sbatch --test-only` start estimates and their time-zone
+  conversion, GPU-type probes), and `RCLUST_TEST_SUBMIT=1` to also submit one tiny job to each.
+  They only reuse connections from `rclust connect`, and are skipped by a plain `uv run pytest`.
+
 ## 0.3.1
 
 Fixes from a first run against real clusters.

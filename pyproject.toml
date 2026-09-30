@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clusterscheduler"
-version = "0.3.1"
+version = "0.3.2"
 description = "Send a Slurm job to whichever of your clusters will start it soonest."
 readme = "README.md"
 license = "MIT"
@@ -28,3 +28,6 @@ dev = ["pytest>=9.0.2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "cluster: talks to real clusters from your rclust config; skipped unless RCLUST_TEST_CLUSTERS is set",
+]
