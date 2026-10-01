@@ -29,7 +29,7 @@ uv tool install git+https://github.com/narunraman/rclust
 ```bash
 rclust config                 # add your clusters (writes ~/.config/rclust/config.yaml)
 rclust connect                # log in to each once; answer any two-factor prompts
-rclust discover               # optional: list each cluster's GPU types for the config
+rclust discover               # optional: find each cluster's GPU types and save them to the config
 rclust learn                  # read recent queue history (takes a minute the first time)
 rclust suggest job.sh         # where would it go?
 rclust submit job.sh          # send it there
@@ -66,7 +66,7 @@ clusters:
     cpu_account: my-project-cpu   # optional: account for CPU-only jobs, if your site splits them
     remote_dir: ~/jobs            # where scripts are copied (default ~/cluster_scheduler_jobs)
     resources:
-      gpus: ["a100"]              # as printed by `rclust discover`
+      gpus: ["a100"]              # as found by `rclust discover` (it offers to save them)
     # ssh_key: ~/.ssh/id_ed25519  # optional: otherwise your SSH agent / config
 ```
 

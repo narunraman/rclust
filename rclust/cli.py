@@ -293,15 +293,19 @@ def _check_names(scheduler, names, option=None):
 
 @main.command()
 @click.argument("clusters", nargs=-1)
+@click.option("--save/--no-save", default=None,
+              help="Write the GPU types into the config without asking (--no-save: only print).")
 @click.pass_context
-def discover(ctx, clusters):
+def discover(ctx, clusters, save):
     """
-    List the GPU types on each cluster.
+    List the GPU types on each cluster, and offer to save them to the config.
 
-    Prints a `resources` block per cluster, as plain YAML on stdout, to paste
-    into its entry in the config, so jobs that need GPUs skip clusters
-    without them. Types come from sinfo's GRES column, including partitions
-    hidden from a plain `sinfo`.
+    Prints a `resources` block per cluster as plain YAML on stdout. In a
+    terminal it then asks whether to write them into the config; --save
+    writes without asking, --no-save only prints. Saving replaces each probed
+    cluster's `resources: gpus:` list and leaves the rest of its entry alone,
+    so jobs that need GPUs skip clusters without them. Types come from sinfo's
+    GRES column, including partitions hidden from a plain `sinfo`.
     """
     import re
 
@@ -312,6 +316,7 @@ def discover(ctx, clusters):
     failed = _connect_all(targets)
     err = Console(stderr=True)  # progress and notes on stderr; the YAML alone on stdout
     lines = []
+    found = {}
     for cluster in targets:
         if cluster.name in failed:
             continue
@@ -322,6 +327,7 @@ def discover(ctx, clusters):
             err.print(f"[red]✗ {cluster.name}:[/red] {_esc(e)}")
             failed.add(cluster.name)
             continue
+        found[cluster.name] = gpus
         lines.append(f"  {cluster.name}:")
         if gpus:
             lines += ["    resources:", "      gpus:"]
@@ -330,10 +336,55 @@ def discover(ctx, clusters):
         else:
             lines.append("    # no GPUs found")
     if lines:
-        err.print("[dim]# Add to each cluster in your config:[/dim]")
         click.echo("clusters:\n" + "\n".join(lines))
+    if found:
+        if save is None:
+            import sys
+            from rich.prompt import Confirm
+
+            save = sys.stdin.isatty() and sys.stdout.isatty() and Confirm.ask(
+                "Save these GPU types to your config?", default=True, console=err)
+        if save:
+            _save_discovered(ctx, found, err)
     if failed:
         fail(f"could not probe {', '.join(sorted(failed))}")
+
+
+def _save_discovered(ctx, found, err):
+    """Write each cluster's discovered GPU types into its `resources: gpus:` in the config."""
+    import yaml
+    from .config import find_config
+
+    path = find_config(ctx.obj.config_path)
+    if path is None:
+        fail("no config file to save to", "Create one with `rclust config`.")
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (yaml.YAMLError, OSError) as e:
+        fail(f"could not read {path}: {e}")
+    clusters = data.get("clusters") or {}
+    changed = []
+    for name, gpus in found.items():
+        entry = clusters.get(name)
+        if entry is None:
+            continue
+        resources = entry.setdefault("resources", {}) or {}
+        entry["resources"] = resources
+        if gpus:
+            if resources.get("gpus") != gpus:
+                resources["gpus"] = list(gpus)
+                changed.append(name)
+        elif "gpus" in resources:
+            del resources["gpus"]
+            changed.append(name)
+        if not resources:
+            del entry["resources"]
+    if not changed:
+        err.print(f"[dim]{path} already lists these GPU types.[/dim]")
+        return
+    _save_config(path, data)
+    err.print(f"[green]✓ Saved GPU types for {', '.join(changed)} to {path}[/green]"
+              "[dim] (comments in the file are not kept)[/dim]")
 
 
 # --- suggest / submit -----------------------------------------------------------------------------

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3
+
+- `rclust discover` offers to save the GPU types it finds into the config (`--save` to save without
+  asking, `--no-save` to only print). Saving replaces each cluster's `resources: gpus:` list and leaves
+  the rest of its entry alone.
+
 ## 0.3.2
 
 - Placeholder cluster names in tests (`cluster-a`, `hpc1.example.edu`); no real site names.
