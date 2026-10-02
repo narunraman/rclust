@@ -43,7 +43,10 @@ def test_tiny_job_completes(cluster, scheduler, tmp_path, capsys):
     script = tmp_path / "rclust_it.sh"
     script.write_text(
         "#!/bin/bash\n"
-        f"#SBATCH --job-name={tag}\n"
+        # say what the job is, for anyone reading the queue
+        f"#SBATCH --job-name=rclust-integration-test-{tag[-6:]}\n"
+        '#SBATCH --comment="rclust integration test (tests/integration/test_submit.py): '
+        '1 CPU for 1 minute, safe to cancel"\n'
         "#SBATCH --cpus-per-task=1\n"
         "#SBATCH --time=0:01:00\n"
         "#SBATCH --mem=256M\n"

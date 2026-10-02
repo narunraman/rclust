@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4
+
+- The opt-in submit test names its job `rclust-integration-test-<id>` and adds a `--comment` saying what
+  it is and that it is safe to cancel, so it is recognisable in the queue.
+
 ## 0.3.3
 
 - `rclust discover` offers to save the GPU types it finds into the config (`--save` to save without

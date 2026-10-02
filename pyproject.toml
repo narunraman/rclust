@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clusterscheduler"
-version = "0.3.3"
+version = "0.3.4"
 description = "Send a Slurm job to whichever of your clusters will start it soonest."
 readme = "README.md"
 license = "MIT"
