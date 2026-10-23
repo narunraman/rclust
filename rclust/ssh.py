@@ -171,8 +171,9 @@ class SSHClient:
                 ret = subprocess.run(cmd + [self.destination], stdin=sys.stdin, stdout=sys.stdout,
                                      stderr=sys.stderr, timeout=300)
             except subprocess.TimeoutExpired:
-                raise NotConnectedError(f"could not connect to {self.destination}: timed out") from None
-            detail = f"ssh exit code {ret.returncode}"
+                ret, detail = None, "timed out"
+            else:
+                detail = f"ssh exit code {ret.returncode}"
         else:
             # stderr goes to a file, not a pipe: a pipe could stay open in the backgrounded master
             with tempfile.TemporaryFile("w+") as err:
@@ -181,14 +182,15 @@ class SSHClient:
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                          stderr=err, timeout=60)
                 except subprocess.TimeoutExpired:
-                    raise NotConnectedError(self._not_connected("timed out")) from None
+                    ret = None
                 err.seek(0)
                 lines = err.read().strip().splitlines()
-            detail = lines[-1] if lines else f"ssh exit code {ret.returncode}"
-        if ret.returncode != 0 or not self.is_connected():
-            if interactive:
-                raise NotConnectedError(f"could not connect to {self.destination} ({detail})")
-            raise NotConnectedError(self._not_connected(detail))
+            detail = "timed out" if ret is None else lines[-1] if lines else f"ssh exit code {ret.returncode}"
+        if ret is None or ret.returncode != 0 or not self.is_connected():
+            hint = (f"Check that `ssh {self.destination}` works." if interactive else
+                    f"Run `{self.connect_command} {self._label}` to log in (it can answer password or "
+                    "two-factor prompts).")
+            raise NotConnectedError(f"Could not connect to {self._label} ({self.destination}): {detail}. {hint}")
 
     def execute_command(self, cmd: str, timeout: int = 15, use_login_shell: bool = False,
                         input: Optional[str] = None) -> Tuple[int, str, str]:
@@ -223,9 +225,11 @@ class SSHClient:
         return result.returncode, stdout.strip(), stderr
 
     def _command(self, remote_cmd: str, *options: str) -> List[str]:
-        # BatchMode: never prompt here (prompts belong in `connect`, not behind a spinner)
-        return self._get_base_flags() + ["-o", "BatchMode=yes", *options, "-S", str(self.socket_path),
-                                         self.destination, remote_cmd]
+        # BatchMode: never prompt here (prompts belong in `connect`, not behind a spinner).
+        # ControlMaster=no: only use the shared connection, never start one (ssh configs with
+        # `ControlMaster auto` would otherwise make a command try to become the master).
+        return self._get_base_flags() + ["-o", "BatchMode=yes", "-o", "ControlMaster=no", *options,
+                                         "-S", str(self.socket_path), self.destination, remote_cmd]
 
     def _responsive(self) -> bool:
         """Whether the shared connection still answers (a trivial command, briefly)."""

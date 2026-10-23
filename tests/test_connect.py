@@ -62,7 +62,7 @@ def test_connect_without_prompts_says_how_to_log_in():
         client = SSHClient("h.example.org", name="cluster-a")
         client.connect_command = "mytool connect"
         with patch.object(SSHClient, "is_connected", return_value=False), \
-                pytest.raises(NotConnectedError, match="Permission denied.*run `mytool connect cluster-a`"):
+                pytest.raises(NotConnectedError, match="Could not connect to cluster-a .*Permission denied.*Run `mytool connect cluster-a`"):
             client.connect(interactive=False)
 
 
@@ -92,6 +92,7 @@ def test_login_shell_output_drops_what_the_profile_prints_and_input_goes_to_stdi
         patcher.stop()
     cmd, kwargs = calls[0]
     assert cmd[-1] == "bash -l -c 'echo RCLUST_OUTPUT_START; cat'"
+    assert "ControlMaster=no" in cmd  # never starts a master of its own
     assert kwargs["input"] == "secret"  # never on the command line
 
 
