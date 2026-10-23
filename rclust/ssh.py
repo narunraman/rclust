@@ -13,6 +13,17 @@ from typing import Tuple, Optional, List
 
 logger = logging.getLogger(__name__)
 
+# Printed before a command run in a login shell: anything a site's profile prints before it
+# (banners, module messages) is dropped from the command's output.
+OUTPUT_MARKER = "RCLUST_OUTPUT_START"
+# A shared connection whose network is gone (laptop asleep, Wi-Fi changed) otherwise lingers and
+# makes every command hang; with these, ssh closes it after about a minute of silence.
+KEEPALIVE = ["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+
+
+class NotConnectedError(RuntimeError):
+    """No usable SSH connection to a cluster."""
+
 
 def quote_remote_path(path: str) -> str:
     """Quote one path for a remote *shell command* (ssh), allowing a leading ~/ to mean remote home."""
@@ -52,6 +63,9 @@ def _rsync_env() -> dict:
 
 
 class SSHClient:
+    # What to tell the user to run to log in; tools built on rclust can name their own command.
+    connect_command = "rclust connect"
+
     def __init__(self, host: str, user: Optional[str] = None,
                  key_path: Optional[str] = None, name: Optional[str] = None):
         if not isinstance(host, str) or not host or host.startswith("-") or any(c.isspace() for c in host):
@@ -106,7 +120,8 @@ class SSHClient:
             args.extend(["-i", self.key_path])
         return args
 
-    def _is_connected(self) -> bool:
+    def is_connected(self) -> bool:
+        """Whether a shared (master) connection is open, checked locally."""
         if not self.socket_path.exists():
             return False
         try:
@@ -116,49 +131,129 @@ class SSHClient:
         except (OSError, subprocess.TimeoutExpired):
             return False
 
-    def connect(self, persist: Optional[str] = None):
-        """Authenticate interactively once; reuse the master for subsequent commands.
+    _is_connected = is_connected  # older name
+
+    @property
+    def _label(self) -> str:
+        return self.name or self.host
+
+    def _not_connected(self, detail: str) -> str:
+        return f"not connected to {self._label} ({detail}); run `{self.connect_command} {self._label}`"
+
+    def connect(self, persist: Optional[str] = None, interactive: bool = True):
+        """Authenticate once; reuse the master for subsequent commands.
+
+        Interactive: the terminal is passed through so password and two-factor prompts can be
+        answered. Otherwise the login must succeed without prompting (e.g. SSH keys), and
+        NotConnectedError says to connect interactively.
 
         `persist` sets ControlPersist (how long an idle master stays open). Without it the user's
         ssh config decides; if that sets nothing, the backgrounded master stays open until it is
-        closed (`ssh -O exit`), the machine sleeps or reboots, or the network drops.
+        closed (`ssh -O exit`), the machine sleeps or reboots, or the network drops (noticed
+        within about a minute: KEEPALIVE).
         """
-        if self._is_connected():
+        if self.is_connected():
             return
+        self.socket_path.unlink(missing_ok=True)  # left behind by a master that has exited
         if self._private_socket_dir:
             self._private_socket_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             if self._private_socket_dir.is_symlink() or self._private_socket_dir.stat().st_uid != os.getuid():
                 raise RuntimeError("Unsafe SSH socket directory")
             self._private_socket_dir.chmod(0o700)
-        print(f"Connecting to {self.name or self.host} ({self.destination}); "
-              "answer any password or two-factor prompts...")
-        cmd = self._get_base_flags() + ["-M", "-S", str(self.socket_path)]
+        cmd = self._get_base_flags() + KEEPALIVE + ["-M", "-S", str(self.socket_path)]
         if persist is not None:  # otherwise defer to ControlPersist in the user's ssh config
             cmd.extend(["-o", f"ControlPersist={persist}"])
-        cmd.extend(["-f", "-N", self.destination])
-        ret = subprocess.run(cmd, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
-        if ret.returncode != 0:
-            raise RuntimeError(f"could not connect to {self.destination} (ssh exit code {ret.returncode})")
+        cmd.extend(["-f", "-N"])
+        if interactive:
+            print(f"Connecting to {self._label} ({self.destination}); "
+                  "answer any password or two-factor prompts...", file=sys.stderr)
+            try:
+                ret = subprocess.run(cmd + [self.destination], stdin=sys.stdin, stdout=sys.stdout,
+                                     stderr=sys.stderr, timeout=300)
+            except subprocess.TimeoutExpired:
+                raise NotConnectedError(f"could not connect to {self.destination}: timed out") from None
+            detail = f"ssh exit code {ret.returncode}"
+        else:
+            # stderr goes to a file, not a pipe: a pipe could stay open in the backgrounded master
+            with tempfile.TemporaryFile("w+") as err:
+                try:
+                    ret = subprocess.run(cmd + ["-o", "BatchMode=yes", self.destination],
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=err, timeout=60)
+                except subprocess.TimeoutExpired:
+                    raise NotConnectedError(self._not_connected("timed out")) from None
+                err.seek(0)
+                lines = err.read().strip().splitlines()
+            detail = lines[-1] if lines else f"ssh exit code {ret.returncode}"
+        if ret.returncode != 0 or not self.is_connected():
+            if interactive:
+                raise NotConnectedError(f"could not connect to {self.destination} ({detail})")
+            raise NotConnectedError(self._not_connected(detail))
 
-    def execute_command(self, cmd: str, timeout: int = 15,
-                        use_login_shell: bool = False) -> Tuple[int, str, str]:
-        real_cmd = f"bash -l -c {shlex.quote(cmd)}" if use_login_shell else cmd
-        # BatchMode: never prompt here (prompts belong in `connect`, not behind a spinner)
-        ssh_args = self._get_base_flags() + ["-o", "BatchMode=yes", "-S", str(self.socket_path),
-                                           self.destination, real_cmd]
+    def execute_command(self, cmd: str, timeout: int = 15, use_login_shell: bool = False,
+                        input: Optional[str] = None) -> Tuple[int, str, str]:
+        """Run a command on the login node. Returns (exit code, stdout, stderr); never prompts.
+
+        `use_login_shell` runs it under `bash -l`, so site profiles are loaded (on some clusters
+        only they put Slurm on the PATH); anything they print is dropped from stdout. `input` is
+        sent on stdin (use it for secrets, which must not appear in command lines).
+
+        A lost connection gives exit code 255 and a "not connected" message, including one that
+        stopped responding: a command that times out is followed by a quick check, and if the
+        connection does not answer either it is closed, so the next `connect` starts afresh.
+        """
+        real_cmd = f"bash -l -c {shlex.quote(f'echo {OUTPUT_MARKER}; {cmd}')}" if use_login_shell else cmd
         try:
-            result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(self._command(real_cmd), input=input, capture_output=True,
+                                    text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            return -1, "", "SSH command timed out"
+            if self._responsive():
+                return -1, "", "SSH command timed out"
+            self._close()
+            return 255, "", self._not_connected("the connection stopped responding and was closed")
         except OSError as e:
             return -1, "", str(e)
-        stderr = result.stderr.strip()
-        if result.returncode == 255 and not self._is_connected():
+        stdout, stderr = result.stdout, result.stderr.strip()
+        if use_login_shell:
+            _, found, rest = stdout.partition(OUTPUT_MARKER + "\n")
+            stdout = rest if found else stdout
+        if result.returncode == 255 and not self.is_connected():
             # BatchMode ssh fails rather than prompting when there is no open connection
-            detail = stderr.splitlines()[-1] if stderr else "ssh failed"
-            name = self.name or self.host
-            stderr = f"not connected to {name} ({detail}); run `rclust connect {name}`"
-        return result.returncode, result.stdout.strip(), stderr
+            stderr = self._not_connected(stderr.splitlines()[-1] if stderr else "ssh failed")
+        return result.returncode, stdout.strip(), stderr
+
+    def _command(self, remote_cmd: str, *options: str) -> List[str]:
+        # BatchMode: never prompt here (prompts belong in `connect`, not behind a spinner)
+        return self._get_base_flags() + ["-o", "BatchMode=yes", *options, "-S", str(self.socket_path),
+                                         self.destination, remote_cmd]
+
+    def _responsive(self) -> bool:
+        """Whether the shared connection still answers (a trivial command, briefly)."""
+        try:
+            return subprocess.run(self._command("true"), capture_output=True, timeout=10).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _close(self) -> None:
+        """Close a shared connection that no longer answers, so the next `connect` opens a new one."""
+        try:
+            subprocess.run(self._get_base_flags() + ["-O", "exit", "-S", str(self.socket_path), self.destination],
+                           capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self.socket_path.unlink(missing_ok=True)  # if the master itself is stuck
+
+    def execute_streaming(self, cmd: str, timeout: int = 300) -> int:
+        """Run a command with its output shown live in the terminal. Returns the exit code.
+
+        LogLevel=ERROR hides ssh's "Shared connection to ... closed." line (printed at the INFO
+        level after every session with a terminal) but still shows connection errors.
+        """
+        try:
+            return subprocess.run(self._command(cmd, "-o", "LogLevel=ERROR", "-tt"), timeout=timeout).returncode
+        except subprocess.TimeoutExpired:
+            print(f"\nCommand timed out after {timeout}s", file=sys.stderr)
+            return -1
 
     def rsync(self, local_path: str, remote_path: str) -> bool:
         """Copy to the cluster. On failure returns False and sets `last_rsync_error`."""
