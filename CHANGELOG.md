@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - A shared connection whose network is gone (laptop asleep, Wi-Fi changed) no longer makes every
   command hang: the master uses ssh keepalives, and a command that times out is followed by a quick
