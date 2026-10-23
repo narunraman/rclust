@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- A shared connection whose network is gone (laptop asleep, Wi-Fi changed) no longer makes every
+  command hang: the master uses ssh keepalives, and a command that times out is followed by a quick
+  check; if the connection does not answer, it is closed and reported as not connected.
+- `SSHClient.connect(interactive=False)` connects without prompting (or raises `NotConnectedError`
+  saying how to log in); `connect` removes a socket left by a master that has exited.
+- `SSHClient.execute_command` takes `input` (sent on stdin, for secrets) and, with
+  `use_login_shell`, drops anything the site profile prints from the output. New:
+  `is_connected()`, `execute_streaming()`, and `connect_command`, the command named in "not
+  connected" messages (for tools built on rclust).
+
 ## 0.3.4
 
 - The opt-in submit test names its job `rclust-integration-test-<id>` and adds a `--comment` saying what
