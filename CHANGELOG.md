@@ -10,7 +10,14 @@
 - `SSHClient.execute_command` takes `input` (sent on stdin, for secrets) and, with
   `use_login_shell`, drops anything the site profile prints from the output. New:
   `is_connected()`, `execute_streaming()`, and `connect_command`, the command named in "not
-  connected" messages (for tools built on rclust).
+  connected" messages (for tools built on rclust). Commands use `ControlMaster=no`, so they never
+  start a master of their own.
+- GPU types know their memory (GB) and whether they are MIG slices. Both are read from the GPU's
+  name where it says (`nvidia_h100_80gb_hbm3`, `h100_3g.40gb`, or a model with one memory size
+  such as the H100 or L40S), or set with `memory:` and `mig:` under `gpu_types`.
+  `ClusterConfig.gpu_definitions()` lists every GPU type of a cluster with them.
+- `rclust discover` shows each GPU type's memory, and when saving asks for the ones the name does
+  not tell (e.g. A100: 40 or 80 GB), recording them under `gpu_types`.
 
 ## 0.3.4
 

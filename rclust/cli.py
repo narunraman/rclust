@@ -306,10 +306,14 @@ def discover(ctx, clusters, save):
     cluster's `resources: gpus:` list and leaves the rest of its entry alone,
     so jobs that need GPUs skip clusters without them. Types come from sinfo's
     GRES column, including partitions hidden from a plain `sinfo`.
-    """
-    import re
 
+    Each type's memory is shown when its name says it (e.g. nvidia_h100_80gb_hbm3,
+    h100_3g.40gb, or a model with one memory size such as the H100); for the others
+    (e.g. A100: 40 or 80 GB) saving asks for it and records it under `gpu_types`.
+    """
     from rich.console import Console
+
+    from .config import gpu_definitions
 
     scheduler = get_scheduler(ctx)
     targets = _select(scheduler, clusters)
@@ -328,11 +332,14 @@ def discover(ctx, clusters, save):
             failed.add(cluster.name)
             continue
         found[cluster.name] = gpus
+        known = {d["slurm_spec"]: d for d in gpu_definitions({**cluster.resources, "gpus": gpus})}
         lines.append(f"  {cluster.name}:")
         if gpus:
             lines += ["    resources:", "      gpus:"]
-            lines += [f'        - "{g}"' + ("  # MIG slice" if re.search(r"\d+g\.\d+gb", g) else "")
-                      for g in gpus]
+            for g in gpus:
+                d = known.get(g) or {"memory": None, "mig": False}
+                notes = [f"{d['memory']} GB" if d["memory"] else "memory unknown"] + (["MIG slice"] if d["mig"] else [])
+                lines.append(f'        - "{g}"  # {", ".join(notes)}')
         else:
             lines.append("    # no GPUs found")
     if lines:
@@ -350,6 +357,12 @@ def discover(ctx, clusters, save):
         fail(f"could not probe {', '.join(sorted(failed))}")
 
 
+def _can_ask() -> bool:
+    import sys
+
+    return sys.stdin.isatty()
+
+
 def _save_discovered(ctx, found, err):
     """Write each cluster's discovered GPU types into its `resources: gpus:` in the config."""
     import yaml
@@ -364,6 +377,11 @@ def _save_discovered(ctx, found, err):
         fail(f"could not read {path}: {e}")
     clusters = data.get("clusters") or {}
     changed = []
+    from rich.prompt import IntPrompt
+
+    from .config import gpu_definitions
+
+    ask = _can_ask()
     for name, gpus in found.items():
         entry = clusters.get(name)
         if entry is None:
@@ -377,6 +395,22 @@ def _save_discovered(ctx, found, err):
         elif "gpus" in resources:
             del resources["gpus"]
             changed.append(name)
+        # GPU memory the names do not tell: ask, and record it under gpu_types
+        current = {**resources, **({"gpu_types": entry["gpu_types"]} if "gpu_types" in entry else {})}
+        for d in gpu_definitions(current):
+            if d["memory"] or d["slurm_spec"] not in gpus or not ask:
+                continue
+            memory = IntPrompt.ask(f"Memory (GB) of one {d['slurm_spec']} GPU on {name} (0 to skip)",
+                                   default=0, console=err)
+            if memory > 0:
+                types = entry.setdefault("gpu_types", []) if "gpu_types" in entry else resources.setdefault("gpu_types", [])
+                spec = next((g for g in types if (g.get("slurm_spec") or g["type"]) == d["slurm_spec"]), None)
+                if spec is None:
+                    types.append({"type": d["slurm_spec"], "memory": memory})
+                else:
+                    spec["memory"] = memory
+                if name not in changed:
+                    changed.append(name)
         if not resources:
             del entry["resources"]
     if not changed:
