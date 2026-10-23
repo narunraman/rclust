@@ -56,7 +56,8 @@ def test_discover_prints_plain_yaml_on_stdout(tmp_path):
     data = yaml.safe_load(stdout)
     assert data["clusters"]["cluster-a"]["resources"]["gpus"] == ["a5000", "nvidia_h100_80gb_hbm3_1g.10gb"]
     assert "cluster-b" in data["clusters"]
-    assert "# MIG slice" in stdout
+    assert '- "a5000"  # 24 GB\n' in stdout
+    assert '- "nvidia_h100_80gb_hbm3_1g.10gb"  # 10 GB, MIG slice\n' in stdout
 
 
 def _two_clusters(tmp_path, text):
@@ -97,3 +98,20 @@ def test_discover_without_a_terminal_only_prints(tmp_path):
     assert result.exit_code == 0, result.output
     assert path.read_text() == text
     assert yaml.safe_load(result.stdout)["clusters"]["cluster-a"]["resources"]["gpus"][0] == "h100"
+
+
+def test_discover_save_asks_for_memory_the_names_do_not_tell(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("clusters:\n  cluster-a:\n    host: hpc1.example.edu\n  cluster-b: {}\n")
+    api = Scheduler(str(path), project_dir=tmp_path / "state")
+    a, b = api.dispatcher.clusters
+    for cluster in (a, b):
+        cluster._ssh_provider = lambda _: Mock()
+    a.discover_resources = Mock(return_value={"gpus": ["a100", "h100"]})  # A100: 40 or 80 GB
+    b.discover_resources = Mock(return_value={})
+    with patch("rclust.cli.get_scheduler", return_value=api), patch("rclust.cli._can_ask", return_value=True):
+        result = CliRunner().invoke(main, ["--config", str(path), "discover", "--save"], input="80\n")
+    assert result.exit_code == 0, result.output
+    assert "Memory (GB) of one a100 GPU on cluster-a" in result.stderr  # not asked for the h100
+    entry = yaml.safe_load(path.read_text())["clusters"]["cluster-a"]
+    assert entry["resources"] == {"gpus": ["a100", "h100"], "gpu_types": [{"type": "a100", "memory": 80}]}

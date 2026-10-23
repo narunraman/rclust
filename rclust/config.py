@@ -21,6 +21,10 @@ class ClusterConfig:
     # e.g. {"gpus": ["a100", "v100"], "gpu_types": [{"type": "h100", "slurm_spec": ...}]}
     resources: dict = field(default_factory=dict)
 
+    def gpu_definitions(self) -> List[dict]:
+        """Every GPU type of this cluster with its Slurm spec, memory and MIG flag (see below)."""
+        return gpu_definitions(self.resources)
+
     @classmethod
     def from_dict(cls, name: str, data: Optional[dict]) -> "ClusterConfig":
         if not isinstance(name, str) or not name.strip():
@@ -49,6 +53,14 @@ class ClusterConfig:
             for g in gpu_types
         ):
             raise ConfigError(f"cluster '{name}': gpu_types must be a list of GPU definitions")
+        for g in gpu_types:
+            memory = g.get("memory")
+            if memory is not None and (isinstance(memory, bool) or not isinstance(memory, (int, float))
+                                       or memory <= 0):
+                raise ConfigError(f"cluster '{name}': memory of GPU type '{g['type']}' must be a number of GB")
+            for flag in ("mig", "is_full_gpu"):
+                if g.get(flag) is not None and not isinstance(g[flag], bool):
+                    raise ConfigError(f"cluster '{name}': {flag} of GPU type '{g['type']}' must be true or false")
         if "gpu_types" in resources:
             if not resources.get("gpus"):
                 gpus = [g["type"] for g in gpu_types]
@@ -68,6 +80,33 @@ class ClusterConfig:
             tags=set(tags),
             resources=resources,
         )
+
+
+def gpu_definitions(resources: dict) -> List[dict]:
+    """Every GPU type of a cluster, from `gpu_types` and the names in `gpus`, with their memory.
+
+    Each is {"type", "slurm_spec", "memory" (GB, or None if unknown), "mig"}. Memory and MIG are
+    taken from the config when given, else read from the GPU's name (see gpus.gpu_memory_gb);
+    `is_full_gpu: false` (slurm-llm's older spelling) means `mig: true`.
+    """
+    from .gpus import gpu_memory_gb, is_mig
+
+    defs = {}
+    for g in resources.get("gpu_types") or []:
+        defs[g["type"]] = {"type": g["type"], "slurm_spec": g.get("slurm_spec") or g["type"],
+                           "memory": g.get("memory"), "mig": g.get("mig")}
+        if defs[g["type"]]["mig"] is None and g.get("is_full_gpu") is not None:
+            defs[g["type"]]["mig"] = not g["is_full_gpu"]
+    named = set(defs) | {d["slurm_spec"] for d in defs.values()}
+    for gpu in resources.get("gpus") or []:
+        if gpu not in named and gpu != "generic":
+            defs[gpu] = {"type": gpu, "slurm_spec": gpu, "memory": None, "mig": None}
+    for d in defs.values():
+        if d["memory"] is None:
+            d["memory"] = gpu_memory_gb(d["slurm_spec"]) or gpu_memory_gb(d["type"])
+        if d["mig"] is None:
+            d["mig"] = is_mig(d["slurm_spec"]) or is_mig(d["type"])
+    return list(defs.values())
 
 
 def user_config_path() -> Path:
